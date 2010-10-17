@@ -152,6 +152,10 @@ ensure this, but this is currently not implemented.
 
 * What I Don't Like
 
+  - Copying values to the blocked tasklet is completed by the running
+    tasklet instead of the newly unblocked tasklet.  This means that
+    any callbacks for tasklets are run by the wrong tasklet (i.e. they
+    should be run right before select/send/receive return).
   - Creating an alt object for each operation.  I don't know if
     there's a feasible way around this, and in any case the fact that
     they are reusable makes this mostly irrelevant.
