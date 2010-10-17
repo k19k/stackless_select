@@ -1,0 +1,1081 @@
+Index: Python/Python-ast.c
+===================================================================
+--- Python/Python-ast.c	(revision 80207)
++++ Python/Python-ast.c	(working copy)
+@@ -2,7 +2,7 @@
+ 
+ 
+ /*
+-   __version__ 62047.
++   __version__ 62285.
+ 
+    This module must be committed separately after each AST grammar change;
+    The __version__ number is set to the revision number of the commit
+@@ -6300,7 +6300,7 @@
+         if (PyDict_SetItemString(d, "AST", (PyObject*)&AST_type) < 0) return;
+         if (PyModule_AddIntConstant(m, "PyCF_ONLY_AST", PyCF_ONLY_AST) < 0)
+                 return;
+-        if (PyModule_AddStringConstant(m, "__version__", "62047") < 0)
++        if (PyModule_AddStringConstant(m, "__version__", "62285") < 0)
+                 return;
+         if (PyDict_SetItemString(d, "mod", (PyObject*)mod_type) < 0) return;
+         if (PyDict_SetItemString(d, "Module", (PyObject*)Module_type) < 0)
+Index: Stackless/module/taskletobject.c
+===================================================================
+--- Stackless/module/taskletobject.c	(revision 80207)
++++ Stackless/module/taskletobject.c	(working copy)
+@@ -1203,16 +1203,162 @@
+ 					    : task->cstate->nesting_level);
+ }
+ 
++/*
++ * Simple congruential random number generator from ANSI C.
++ */
++static int
++nrand(int n)
++{
++	static unsigned long next = 1;
++	next = next * 1103515245 + 12345;
++	return (next / 65536) % n;
++}
++
++/*
++ * One-pass random selection of a ready tasklet.
++ */
++static PyAltObject *
++tasklet_get_ready(PyTaskletObject *task, PyObject *alts)
++{
++	Py_ssize_t size;
++	Py_ssize_t i;
++	int n = 1;
++	PyObject *tmp;
++	PyObject *result = NULL;
++
++	size = PyList_Size(alts);
++	for (i = 0; i < size; i++) {
++		tmp = PyList_GET_ITEM(alts, i);
++		if (!PyAlt_Check(tmp))
++			TYPE_ERROR("expected alt", NULL);
++		if (PyAlt_READY(tmp)) {
++			if (nrand(n) == 0)
++				result = tmp;
++			n++;
++		}
++	}
++
++	return (PyAltObject *) result;
++}
++
+ static PyObject *
++tasklet_insert_alts(PyTaskletObject *task, PyObject *alts)
++{
++	PyAltObject *tmp;
++	Py_ssize_t i, n;
++
++	n = PyList_Size(alts);
++	for (i = 0; i < n; i++) {
++		tmp = (PyAltObject *) PyList_GET_ITEM(alts, i);
++		if (tmp->channel->flags.closing) {
++			PyErr_SetNone(PyExc_StopIteration);
++			return NULL;
++		}
++		task->flags.blocked |= tmp->flags.dir;
++		slp_channel_insert(tmp->channel, tmp);
++	}
++
++	Py_XDECREF(task->alts);
++	task->alts = alts;
++	Py_INCREF(alts);
++
++	return alts;
++}
++
++PyObject *
++PyTasklet_Select(PyTaskletObject *source, PyObject *alts)
++{
++	STACKLESS_GETARG();
++	PyThreadState *ts = PyThreadState_GET();
++	PyTaskletObject *target;
++	PyAltObject *ready = NULL, *alt;
++	int interthread = 0;
++	PyObject *retval;
++
++	// TODO: NOTIFY_CHANNEL
++
++	assert(PyList_Check(alts));
++	ready = tasklet_get_ready(source, alts);
++	if (ready) {
++		/* communication 1): there is somebody waiting */
++		if ( (alt = slp_alt_action(ready)) == NULL)
++			return NULL;
++		target = alt->tasklet;
++		interthread = target->cstate->tstate != ts;
++
++		retval = slp_alt_result(ready);
++		TASKLET_SETVAL_OWN(source, retval);
++		TASKLET_SETVAL_OWN(target, slp_alt_result(alt));
++
++		if (interthread) {
++			;
++			/* interthread, always keep target!
++			slp_current_insert(target);*/
++		}
++		else {
++			if (alt->channel->flags.schedule_all) {
++				/* target goes last */
++				slp_current_insert(target);
++				/* always schedule away from source */
++				target = source->next;
++			}
++			else if (alt->channel->flags.preference == alt->flags.dir) {
++				/* move target after source */
++				ts->st.current = source->next;
++				slp_current_insert(target);
++				ts->st.current = source;
++			}
++			else {
++				/* otherwise we return to the caller */
++				slp_current_insert(target);
++				target = source;
++			}
++		}
++
++		Py_DECREF(alt);
++	}
++	else {
++		/* communication 2): there is nobody waiting */
++		if (source->flags.block_trap)
++			RUNTIME_ERROR("this tasklet does not like to be"
++				      " blocked.", NULL);
++		if (!tasklet_insert_alts(source, alts))
++			return NULL;
++		slp_current_remove();
++		target = ts->st.current;
++	}
++	retval = slp_schedule_task(source, target, stackless);
++	if (interthread) {
++		if (ready) {
++			Py_DECREF(target);
++		}
++	}
++	return retval;
++}
++
++static PyObject *
++tasklet_get_alts(PyTaskletObject *task)
++{
++	PyObject *ret = task->alts;
++	if (ret == NULL || !task->flags.blocked) {
++		ret = Py_None;
++	}
++	Py_INCREF(ret);
++	return ret;
++}
++
++static PyObject *
+ tasklet_get_channel(PyTaskletObject *task)
+ {
+-	PyTaskletObject *prev = task->prev;
++	PyObject *alts = task->alts;
+ 	PyObject *ret = Py_None;
+-	if (prev != NULL && task->flags.blocked) {
+-		/* search left, optimizing in-oder access */
+-		while (!PyChannel_Check(prev))
+-			prev = prev->prev;
+-		ret = (PyObject *) prev;
++	if (alts != NULL && task->flags.blocked) {
++		assert(PyList_Check(alts));
++		ret = PyList_GetItem(alts, 0);
++		if (ret != NULL) {
++			assert(PyAlt_Check(ret));
++			ret = (PyObject *) ((PyAltObject *) ret)->channel;
++		}
+ 	}
+ 	Py_INCREF(ret);
+ 	return ret;
+@@ -1263,10 +1409,15 @@
+ 	{"prev", (getter)tasklet_get_prev, NULL,
+ 	 "the previous tasklet in a circular list of tasklets"},
+ 
++	{"_alts", (getter)tasklet_get_alts, NULL,
++	 "The list of alt operations this tasklet is blocked on, or None if it\n"
++	 "is not blocked."
++	},
++
+ 	{"_channel", (getter)tasklet_get_channel, NULL, 
+ 	 "The channel this tasklet is blocked on, or None if it is not blocked.\n"
+-	 "This computed attribute may cause a linear search and should normally\n"
+-	 "not be used, or be replaced by a real attribute in a derived type."
++	 "This computed attribute is equivalent to the channel attribute of the\n"
++	 "first alt operation in the alts list."
+ 	},
+ 
+ 	{"blocked", (getter)tasklet_get_blocked, NULL, 
+Index: Stackless/module/channelobject.c
+===================================================================
+--- Stackless/module/channelobject.c	(revision 80207)
++++ Stackless/module/channelobject.c	(working copy)
+@@ -23,9 +23,7 @@
+ 	 * if it will have the same direction. :-/
+ 	 */
+ 	while (ch->balance) {
+-		int dir = ch->balance > 0 ? 1 : -1;
+-
+-		ob = (PyObject *) slp_channel_remove(ch, dir);
++		ob = (PyObject *) slp_channel_remove(ch);
+ 		Py_DECREF(ob);
+ 	}
+ }
+@@ -50,10 +48,10 @@
+ channel_traverse(PyChannelObject *ch, visitproc visit, void *arg)
+ {
+ 	int err;
+-	PyTaskletObject *p;
++	PyAltObject *p;
+ 
+ #define VISIT(o) if (o) {if ((err = visit((PyObject *)(o), arg))) return err;}
+-	for (p = ch->head; p != (PyTaskletObject *) ch; p = p->next) {
++	for (p = ch->head; p != (PyAltObject *) ch; p = p->next) {
+ 		VISIT(p);
+ 	}
+ #undef VISIT
+@@ -61,60 +59,61 @@
+ }
+ 
+ void
+-slp_channel_insert(PyChannelObject *channel, PyTaskletObject *task, int dir)
++slp_channel_insert(PyChannelObject *channel, PyAltObject *alt)
+ {
+-	SLP_HEADCHAIN_INSERT(PyTaskletObject, channel, task, next, prev);
+-	channel->balance += dir;
+-	task->flags.blocked = dir;
++	SLP_HEADCHAIN_INSERT(PyAltObject, channel, alt, next, prev);
++	channel->balance += alt->flags.dir;
++	alt->tasklet->flags.blocked |= alt->flags.dir;
+ }
+ 
+-PyTaskletObject *
+-slp_channel_remove(PyChannelObject *channel, int dir)
++PyAltObject *
++slp_channel_remove(PyChannelObject *channel)
+ {
+-	PyTaskletObject *ret = channel->head;
++	PyAltObject *ret = channel->head;
+ 
+-	assert(PyTasklet_Check(ret));
++	assert(PyAlt_Check(ret));
+ 
+-        channel->balance -= dir;
++	channel->balance -= ret->flags.dir;
+ 	SLP_HEADCHAIN_REMOVE(ret, next, prev);
+-	ret->flags.blocked = 0;
+-        return ret;
+-};
++	ret->tasklet->flags.blocked = 0;
++	return ret;
++}
+ 
+ /* the special case to remove a specific tasklet */
+ 
+-PyTaskletObject *
+-slp_channel_remove_specific(PyChannelObject *channel, int dir,
+-			    PyTaskletObject *task)
++PyAltObject *
++slp_channel_remove_specific(PyChannelObject *channel, PyAltObject *alt)
+ {
+-	/* note: we assume that the task is in the channel! */
++	/* note: we assume that the alt is in the channel! */
+ 
+-	assert(PyTasklet_Check(task));
+-	channel->balance -= dir;
+-	SLP_HEADCHAIN_REMOVE(task, next, prev);
+-	task->flags.blocked = 0;
+-	return task;
++	assert(PyAlt_Check(alt));
++	channel->balance -= alt->flags.dir;
++	SLP_HEADCHAIN_REMOVE(alt, next, prev);
++	//alt->tasklet->flags.blocked = 0;
++	return alt;
+ }
+ 
+-/* freeing a tasklet without an explicit channel */
+-
+ PyTaskletObject *
+ slp_channel_remove_slow(PyTaskletObject *task)
+ {
+-	int dir;
+ 	PyChannelObject *channel;
+-	PyTaskletObject *prev = task->prev;
++	PyAltObject *alt;
++	Py_ssize_t i, n;
+ 
+ 	assert(task->flags.blocked);
+-	while (!PyChannel_Check(prev))
+-		prev = prev->prev;
+-	channel = (PyChannelObject *) prev;
+-	assert(channel->balance);
+-	dir = channel->balance > 0 ? 1 : -1;
+-	return slp_channel_remove_specific(channel, dir, task);;
++	assert(PyList_Check(task->alts));
++
++	n = PyList_Size(task->alts);
++	for (i = 0; i < n; i++) {
++		alt = (PyAltObject *) PyList_GET_ITEM(task->alts, i);
++		channel = alt->channel;
++		assert(channel->balance);
++		slp_channel_remove_specific(channel, alt);
++	}
++	task->flags.blocked = 0;
++	return task;
+ }
+ 
+-
+ PyChannelObject *
+ PyChannel_New(PyTypeObject *type)
+ {
+@@ -126,7 +125,7 @@
+ 		TYPE_ERROR("channel_new: type must be subtype of channel", NULL);
+ 	c = (PyChannelObject *) type->tp_alloc(type, 0);
+ 	if (c != NULL) {
+-		c->head = c->tail = (PyTaskletObject *) c;
++		c->head = c->tail = (PyAltObject *) c;
+ 		c->balance = 0;
+ 		c->chan_weakreflist = NULL;
+ 		*(int*)&c->flags = 0;
+@@ -148,7 +147,7 @@
+ static PyObject *
+ channel_get_queue(PyChannelObject *self)
+ {
+-	PyObject *ret = (PyObject*) self->head;
++	PyObject *ret = (PyObject *) self->head;
+ 
+ 	if (ret == (PyObject *) self)
+ 		ret = Py_None;
+@@ -246,7 +245,7 @@
+ 
+ static PyGetSetDef channel_getsetlist[] = {
+ 	{"queue",		(getter)channel_get_queue, NULL,
+-	 "the chain of waiting tasklets."},
++	 "the chain of waiting select cases."},
+ 	{"closing",		(getter)channel_get_closing, NULL,
+ 	 "True when close was called."},
+ 	{"closed",		(getter)channel_get_closed, NULL,
+@@ -400,73 +399,30 @@
+ static PyObject *
+ generic_channel_action(PyChannelObject *self, PyObject *arg, int dir, int stackless)
+ {
+-	PyThreadState *ts = PyThreadState_GET();
+-	PyTaskletObject *source = ts->st.current;
+-	PyTaskletObject *target = self->head;
+-	int cando = dir > 0 ? self->balance < 0 : self->balance > 0;
+-	int interthread = cando ? target->cstate->tstate != ts : 0;
++	PyAltObject *alt;
++	PyObject *list;
+ 	PyObject *retval;
+ 
+-	assert(abs(dir) == 1);
++	if ( !(alt = PyAlt_New(NULL, (PyObject *) self, dir, arg, Py_None)))
++		return NULL;
++	list = Py_BuildValue("[O]", alt);
++	Py_DECREF(alt);
++	if (!list)
++		return NULL;
++	retval = PyTasklet_Select(alt->tasklet, list);
++	Py_DECREF(list);
+ 
+-	TASKLET_SETVAL(source, arg);
+-
+-	/* note that notify might release the GIL. */
+-	/* XXX for the moment, we notify late on interthread */
+-	if (!interthread)
+-		NOTIFY_CHANNEL(self, source, dir, cando, NULL);
+-
+-	if (cando) {
+-		/* communication 1): there is somebody waiting */
+-		target = slp_channel_remove(self, -dir);
+-		/* exchange data */
+-		TASKLET_SWAPVAL(source, target);
+-
+-		if (interthread) {
+-			;
+-			/* interthread, always keep target!
+-			slp_current_insert(target);*/
++	if (retval && PyTuple_Check(retval)) {
++		list = retval;
++		if (dir < 0) {
++			assert(PyTuple_Size(list) == 3);
++			retval = PyTuple_GET_ITEM(list, 2);
+ 		}
+-		else {
+-			if (self->flags.schedule_all) {
+-				/* target goes last */
+-				slp_current_insert(target);
+-				/* always schedule away from source */
+-				target = source->next;
+-			}
+-			else if (self->flags.preference == -dir) {
+-				/* move target after source */
+-				ts->st.current = source->next;
+-				slp_current_insert(target);
+-				ts->st.current = source;
+-			}
+-			else {
+-				/* otherwise we return to the caller */
+-				slp_current_insert(target);
+-				target = source;
+-			}
+-		}
++		else
++			retval = Py_None;
++		Py_INCREF(retval);
++		Py_DECREF(list);
+ 	}
+-	else {
+-		/* communication 2): there is nobody waiting */
+-		if (source->flags.block_trap)
+-			RUNTIME_ERROR("this tasklet does not like to be"
+-				      " blocked.", NULL);
+-		if (self->flags.closing) {
+-			PyErr_SetNone(PyExc_StopIteration);
+-			return NULL;
+-		}
+-		slp_current_remove();
+-		slp_channel_insert(self, source, dir);
+-		target = ts->st.current;
+-	}
+-	retval = slp_schedule_task(source, target, stackless);
+-	if (interthread) {
+-		if (cando) {
+-			Py_DECREF(target);
+-		}
+-		NOTIFY_CHANNEL(self, source, dir, cando, NULL);
+-	}
+ 	return retval;
+ }
+ 
+@@ -490,7 +446,23 @@
+ 	return impl_channel_send((PyChannelObject*)myself, arg);
+ }
+ 
++static char channel_sends__doc__[] =
++"channel.sends(value, callback=None) -- returns a new alt object for use\n\
++in a stackless.select() call.";
+ 
++static PyObject *
++channel_sends(PyObject *myself, PyObject *args)
++{
++	PyObject *arg;
++	PyObject *callback = Py_None;
++
++	if (!PyArg_ParseTuple(args, "O|O", &arg, &callback))
++		return NULL;
++
++	return (PyObject *) PyAlt_New(NULL, myself, 1, arg, callback);
++}
++
++
+ static char channel_send_exception__doc__[] =
+ "channel.send_exception(exc, value) -- send an exception over the channel.\n\
+ exc must be a subclass of Exception.\n\
+@@ -617,7 +589,22 @@
+ 	return impl_channel_receive((PyChannelObject*)self);
+ }
+ 
++static char channel_receives__doc__[] =
++"channel.receives(callback=None) -- returns a new alt object for use\n\
++in a call to stackless.select().";
+ 
++static PyObject *
++channel_receives(PyObject *myself, PyObject *args)
++{
++	PyObject *callback = Py_None;
++
++	if (!PyArg_ParseTuple(args, "|O", &callback))
++		return NULL;
++
++	return (PyObject *) PyAlt_New(NULL, myself, -1, Py_None, callback);
++}
++
++
+ /*********************************************************
+ 
+   Sequences in channels.
+@@ -905,16 +892,16 @@
+ channel_reduce(PyChannelObject * ch)
+ {
+ 	PyObject *tup = NULL, *lis = NULL;
+-	PyTaskletObject *t;
++	PyAltObject *a;
+ 	int i, n;
+ 
+ 	lis = PyList_New(0);
+ 	if (lis == NULL) goto err_exit;
+-	t = ch->head;
++	a = ch->head;
+ 	n = abs(ch->balance);
+ 	for (i = 0; i < n; i++) {
+-		if (PyList_Append(lis, (PyObject *) t)) goto err_exit;
+-		t = t->next;
++		if (PyList_Append(lis, (PyObject *) a)) goto err_exit;
++		a = a->next;
+ 	}
+ 	tup = Py_BuildValue("(O()(iiO))",
+ 			    ch->ob_type,
+@@ -934,10 +921,9 @@
+ channel_setstate(PyObject *self, PyObject *args)
+ {
+ 	PyChannelObject *ch = (PyChannelObject *) self;
+-	PyTaskletObject *t;
++	PyAltObject *a;
+ 	PyObject *lis;
+ 	int flags, balance;
+-	int dir;
+ 	Py_ssize_t i, n;
+ 
+ 	if (!PyArg_ParseTuple(args, "iiO!:channel",
+@@ -949,14 +935,13 @@
+ 	channel_clear((PyObject *) ch);
+ 	n = PyList_GET_SIZE(lis);
+ 	*(int *)&ch->flags = flags;
+-	dir = balance > 0 ? 1 : -1;
+ 
+ 	for (i = 0; i < n; i++) {
+-		t = (PyTaskletObject *) PyList_GET_ITEM(lis, i);
++		a = (PyAltObject *) PyList_GET_ITEM(lis, i);
+ 
+-		if (PyTasklet_Check(t) && !t->flags.blocked) {
+-			Py_INCREF(t);
+-			slp_channel_insert(ch, t, dir);
++		if (PyAlt_Check(a) && !a->tasklet->flags.blocked) {
++			Py_INCREF(a);
++			slp_channel_insert(ch, a);
+ 		}
+ 	}
+ 	Py_INCREF(self);
+@@ -983,10 +968,14 @@
+ channel_methods[] = {
+ 	{"send",	    (PCF)channel_send,		    METH_OS,
+ 	 channel_send__doc__},
++	{"sends",	    (PCF)channel_sends,		    METH_VARARGS,
++	 channel_sends__doc__},
+ 	{"send_exception",  (PCF)channel_send_exception,    METH_VS,
+ 	 channel_send_exception__doc__},
+ 	{"receive",	    (PCF)channel_receive,	    METH_NS,
+ 	 channel_receive__doc__},
++	{"receives",	    (PCF)channel_receives,	    METH_VARARGS,
++	 channel_receives__doc__},
+ 	{"close",	    (PCF)channel_close,		    METH_NOARGS,
+ 	channel_close__doc__},
+ 	{"open",	    (PCF)channel_open,		    METH_NOARGS,
+Index: Stackless/module/stacklessmodule.c
+===================================================================
+--- Stackless/module/stacklessmodule.c	(revision 80207)
++++ Stackless/module/stacklessmodule.c	(working copy)
+@@ -8,6 +8,7 @@
+ #define IMPLEMENT_STACKLESSMODULE
+ #include "platf/slp_platformselect.h"
+ #include "core/cframeobject.h"
++#include "altobject.h"
+ #include "taskletobject.h"
+ #include "channelobject.h"
+ #include "pickling/prickelpit.h"
+@@ -145,6 +146,22 @@
+ 	return t;
+ }
+ 
++static char select__doc__[] =
++"select(alts) -- complete an operation on one of the passed alt\n"
++"objects, blocking if necessary.";
++
++static PyObject *
++slp_select(PyObject *self, PyObject *alts)
++{
++	PyThreadState *ts = PyThreadState_GET();
++	PyTaskletObject *t = ts->st.current;
++
++	if (!PyList_Check(alts))
++		TYPE_ERROR("expected a list argument", NULL);
++
++	return PyTasklet_Select(t, alts);
++}
++
+ static char enable_soft__doc__[] =
+ "enable_softswitch(flag) -- control the switching behavior.\n"
+ "Tasklets can be either switched by moving C stack slices around\n"
+@@ -812,6 +829,7 @@
+ 
+ #define PCF PyCFunction
+ #define METH_KS METH_KEYWORDS | METH_STACKLESS
++#define METH_OS METH_O | METH_STACKLESS
+ 
+ static PyMethodDef stackless_methods[] = {
+ 	{"schedule",		    (PCF)schedule,		METH_KS,
+@@ -826,6 +844,8 @@
+ 	 getcurrent__doc__},
+ 	{"getmain",		    (PCF)getmain,		METH_NOARGS,
+ 	 getmain__doc__},
++	{"select",		    (PCF)slp_select,		METH_OS,
++	 select__doc__},
+ 	{"enable_softswitch",	    (PCF)enable_softswitch,	METH_O,
+ 	 enable_soft__doc__},
+ 	{"test_cframe",		    (PCF)test_cframe,		METH_KEYWORDS,
+@@ -1131,6 +1151,7 @@
+ 	    || init_flextype()
+ 	    || init_tasklettype()
+ 	    || init_channeltype()
++	    || init_alttype()
+ 	    )
+ 		return 0;
+ 	return -1;
+Index: Stackless/module/altobject.c
+===================================================================
+--- Stackless/module/altobject.c	(revision 0)
++++ Stackless/module/altobject.c	(revision 0)
+@@ -0,0 +1,250 @@
++/******************************************************
++
++  The Alt (Channel Operation)
++
++ ******************************************************/
++
++#include "Python.h"
++
++#ifdef STACKLESS
++#include "core/stackless_impl.h"
++#include "altobject.h"
++
++PyAltObject *
++PyAlt_New(PyTypeObject *type, PyObject *channel, int dir, PyObject *value,
++	  PyObject *callback)
++{
++	PyAltObject *a;
++
++	if (type == NULL)
++		type = &PyAlt_Type;
++	if (!PyType_IsSubtype(type, &PyAlt_Type))
++		TYPE_ERROR("alt_new: type must be subtype of alt", NULL);
++	if (!PyChannel_Check(channel))
++		TYPE_ERROR("alt_new: channel must be a channel object", NULL);
++	if (abs(dir) != 1)
++		VALUE_ERROR("alt_new: dir must be 1 or -1", NULL);
++
++	a = (PyAltObject *) type->tp_alloc(type, 0);
++	if (a != NULL) {
++		Py_INCREF(channel);
++		Py_INCREF(value);
++		Py_INCREF(callback);
++
++		a->next = NULL;
++		a->prev = NULL;
++		a->flags.dir = dir;
++		a->tasklet = (PyTaskletObject *) PyStackless_GetCurrent();
++		a->channel = (PyChannelObject *) channel;
++		a->tempval = value;
++		a->callback = callback;
++	}
++	return a;
++}
++
++static PyObject *
++alt_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
++{
++        static char *argnames[] = {NULL};
++	PyObject *channel;
++	int dir;
++	PyObject *value = Py_None;
++	PyObject *callback = Py_None;
++
++	if (!PyArg_ParseTupleAndKeywords(args, kwds, "Oi|OO:alt", argnames,
++					 &channel, &dir, &value, &callback))
++		return NULL;
++	return (PyObject *)PyAlt_New(type, channel, dir, value, callback);
++}
++
++static void
++alt_dealloc(PyObject *ob)
++{
++	PyAltObject *alt = (PyAltObject *) ob;
++
++	Py_DECREF(alt->channel);
++	Py_DECREF(alt->tempval);
++	Py_DECREF(alt->callback);
++
++	ob->ob_type->tp_free(ob);
++}
++
++static void
++alt_copy(PyAltObject *sender, PyAltObject *recvr)
++{
++	PyAltObject *t;
++
++	if (sender->flags.dir == -1) {
++		t = sender;
++		sender = recvr;
++		recvr = t;
++	}
++
++	Py_DECREF(recvr->tempval);
++	recvr->tempval = sender->tempval;
++	Py_INCREF(recvr->tempval);
++}
++
++static void
++alt_remove_all(PyAltObject *self)
++{
++	PyAltObject *a;
++	PyObject *lis;
++	Py_ssize_t i, n;
++
++	lis = self->tasklet->alts;
++	self->tasklet->alts = NULL;
++
++	assert(PyList_Check(lis));
++
++	n = PyList_Size(lis);
++	for (i = 0; i < n; i++) {
++		a = (PyAltObject *) PyList_GET_ITEM(lis, i);
++		if (a != self)
++			slp_channel_remove_specific(a->channel, a);
++	}
++
++	Py_DECREF(lis);
++}
++
++PyAltObject *
++slp_alt_action(PyAltObject *self)
++{
++	PyThreadState *ts = PyThreadState_GET();
++	PyTaskletObject *t = ts->st.current;
++	PyAltObject *target;
++
++	assert(PyAlt_Check(self));
++	assert(self->tasklet == t);
++
++	target = slp_channel_remove(self->channel);
++	if (target == NULL)
++		return NULL;
++
++	assert(PyAlt_Check(target));
++	assert(target->tasklet != t);
++
++	Py_INCREF(target);
++
++	alt_copy(self, target);
++	alt_remove_all(target);
++
++	target->tasklet->flags.blocked = 0;
++
++	return target;
++}
++
++PyObject *
++slp_alt_result(PyAltObject *self)
++{
++	PyObject *args;
++	PyObject *retval;
++
++	assert(PyAlt_Check(self));
++
++	if (self->flags.dir == 1) {
++		args = Py_BuildValue("(Oi)", self->channel, self->flags.dir);
++			retval = args;
++	} else {
++		args = Py_BuildValue("(OiO)", self->channel, self->flags.dir,
++				     self->tempval);
++	}
++
++	if (self->callback != Py_None) {
++		retval = PyObject_CallObject(self->callback, args);
++		Py_DECREF(args);
++	} else {
++		retval = args;
++	}
++
++	return retval;
++}
++
++static int
++alt_traverse(PyAltObject *self, visitproc visit, void *arg)
++{
++	Py_VISIT(self->channel);
++	Py_VISIT(self->tempval);
++	Py_VISIT(self->callback);
++	return 0;
++}
++
++static PyObject *
++alt_get_dir(PyAltObject *self)
++{
++	return PyInt_FromLong(self->flags.dir);
++}
++
++static PyGetSetDef alt_getsetlist[] = {
++	{"dir", (getter)alt_get_dir, NULL,
++	 "The direction of this operation (1: send, -1: receive)."},
++	{0}
++};
++
++static PyMemberDef alt_members[] = {
++	{"channel", T_OBJECT, offsetof(PyAltObject, channel), READONLY,
++	 "The channel associated with this operation."},
++	{"tasklet", T_OBJECT, offsetof(PyAltObject, tasklet), READONLY,
++	 "The tasklet associated with this operation."},
++	{0}
++};
++
++static char alt__doc__[] =
++"Alt objects are used for performing selects on sets of channels.";
++
++PyTypeObject PyAlt_Type = {
++	PyObject_HEAD_INIT(&PyType_Type)
++	0,
++	"alt",
++	sizeof(PyAltObject),
++	0,
++	(destructor)alt_dealloc,		/* tp_dealloc */
++	0,					/* tp_print */
++	0,					/* tp_getattr */
++	0,					/* tp_setattr */
++	0,					/* tp_compare */
++	0,					/* tp_repr */
++	0,					/* tp_as_number */
++	0,					/* tp_as_sequence */
++	0,					/* tp_as_mapping */
++	0,					/* tp_hash */
++	0,					/* tp_call */
++	0,					/* tp_str */
++	PyObject_GenericGetAttr,		/* tp_getattro */
++	PyObject_GenericSetAttr,		/* tp_setattro */
++	0,					/* tp_as_buffer */
++	Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
++		Py_TPFLAGS_BASETYPE,		/* tp_flags */
++	alt__doc__,				/* tp_doc */
++ 	(traverseproc)alt_traverse,		/* tp_traverse */
++	0,					/* tp_clear */
++	0,					/* tp_richcompare */
++	0,					/* tp_weaklistoffset */
++	0,					/* tp_iter */
++	0,					/* tp_iternext */
++	0,					/* tp_methods */
++	alt_members,				/* tp_members */
++	alt_getsetlist,				/* tp_getset */
++	0,					/* tp_base */
++	0,					/* tp_dict */
++	0,					/* tp_descr_get */
++	0,					/* tp_descr_set */
++	0,					/* tp_dictoffset */
++	0,					/* tp_init */
++	0,					/* tp_alloc */
++	alt_new,				/* tp_new */
++	_PyObject_GC_Del,			/* tp_free */
++};
++
++/******************************************************
++
++  source module initialization
++
++ ******************************************************/
++
++int init_alttype(void)
++{
++	return PyType_Ready(&PyAlt_Type);
++}
++
++#endif
+Index: Stackless/module/altobject.h
+===================================================================
+--- Stackless/module/altobject.h	(revision 0)
++++ Stackless/module/altobject.h	(revision 0)
+@@ -0,0 +1 @@
++int init_alttype(void);
+Index: Stackless/core/stackless_impl.h
+===================================================================
+--- Stackless/core/stackless_impl.h	(revision 80207)
++++ Stackless/core/stackless_impl.h	(working copy)
+@@ -331,14 +331,25 @@
+ PyAPI_FUNC(void) slp_current_insert_after(PyTaskletObject *task);
+ PyAPI_FUNC(PyTaskletObject *) slp_current_remove(void);
+ PyAPI_FUNC(void) slp_channel_insert(PyChannelObject *channel,
+-				    PyTaskletObject *task, int dir);
+-PyAPI_FUNC(PyTaskletObject *) slp_channel_remove(PyChannelObject *channel,
+-						 int dir);
+-PyAPI_FUNC(PyTaskletObject *) slp_channel_remove_specific(
++				    PyAltObject *alt);
++PyAPI_FUNC(PyAltObject *) slp_channel_remove(PyChannelObject *channel);
++PyAPI_FUNC(PyAltObject *) slp_channel_remove_specific(
+ 				    PyChannelObject *channel,
+-				    int dir, PyTaskletObject *task);
++				    PyAltObject *alt);
+ PyAPI_FUNC(PyTaskletObject *) slp_channel_remove_slow(PyTaskletObject *task);
+ 
++/*
++ * perform the channel action represented by this alt.
++ */
++PyAPI_FUNC(PyAltObject *) slp_alt_action(PyAltObject *self);
++
++/*
++ * get the result of a completed alt.
++ * returns either the result of the alt's callback, or a tuple containing
++ * the alt's (channel, dir) for sends or (channel, dir, value) for receives.
++ */
++PyAPI_FUNC(PyObject *) slp_alt_result(PyAltObject *self);
++
+ /* recording the main thread state */
+ 
+ PyAPI_DATA(PyThreadState *) slp_initial_tstate;
+Index: Stackless/core/stackless_structs.h
+===================================================================
+--- Stackless/core/stackless_structs.h	(revision 80207)
++++ Stackless/core/stackless_structs.h	(working copy)
+@@ -10,6 +10,35 @@
+ 
+ 
+ 
++/*** important structures: alt ***/
++
++
++/***************************************************************************
++
++    Alt (Channel Operation) Flag Definition
++    ---------------------------------------
++
++    dir:	1   this is a send operation.
++		-1  this is a receive operation.
++
++ ***************************************************************************/
++
++typedef struct _alt_flags {
++	int dir: 2;
++} PyAltFlagsStruc;
++
++typedef struct _alt {
++	PyObject_HEAD
++	struct _alt *next;
++	struct _alt *prev;
++	struct _alt_flags flags;
++	struct _tasklet *tasklet;
++	struct _channel *channel;
++	PyObject *tempval;
++	PyObject *callback;
++} PyAltObject;
++
++
+ /*** important structures: tasklet ***/
+ 
+ 
+@@ -19,7 +48,8 @@
+     -----------------------
+ 
+     blocked:	    The tasklet is either waiting in a channel for
+-		    writing (1) or reading (-1) or not blocked (0).
++		    writing (1) or reading (-1), not blocked (0), or
++		    selecting on both reads and writes (-2).
+ 		    Maintained by the channel logic. Do not change.
+ 
+     atomic:	    If true, schedulers will never switch. Driven by
+@@ -82,6 +112,7 @@
+ 		struct _cframe *cframe;
+ 	} f;
+ 	PyObject *tempval;
++	PyObject *alts;
+ 	/* bits stuff */
+ 	struct _tasklet_flags flags;
+ 	int recursion_depth;
+@@ -155,9 +186,8 @@
+ 
+ typedef struct _channel {
+ 	PyObject_HEAD
+-	/* make sure that these fit tasklet's next/prev */
+-	struct _tasklet *head;
+-	struct _tasklet *tail;
++	struct _alt *head;
++	struct _alt *tail;
+ 	int balance;
+ 	struct _channel_flags flags;
+ 	PyObject *chan_weakreflist;
+@@ -210,6 +240,10 @@
+ PyAPI_DATA(PyTypeObject) PyBomb_Type;
+ #define PyBomb_Check(op) ((op)->ob_type == &PyBomb_Type)
+ 
++PyAPI_DATA(PyTypeObject) PyAlt_Type;
++#define PyAlt_Check(op) PyObject_TypeCheck(op, &PyAlt_Type)
++#define PyAlt_CheckExact(op) ((op)->ob_type == &PyAlt_Type)
++
+ PyAPI_DATA(PyTypeObject*) PyTasklet_TypePtr;
+ #define PyTasklet_Type (*PyTasklet_TypePtr)
+ #define PyTasklet_Check(op) PyObject_TypeCheck(op, PyTasklet_TypePtr)
+Index: Stackless/stackless_api.h
+===================================================================
+--- Stackless/stackless_api.h	(revision 80207)
++++ Stackless/stackless_api.h	(working copy)
+@@ -191,6 +191,9 @@
+ PyAPI_FUNC(int) PyTasklet_Restorable(PyTaskletObject *task);
+ /* 1 if the tasklet can execute after unpickling, else 0 */
+ 
++PyAPI_FUNC(PyObject *) PyTasklet_Select(PyTaskletObject *task, PyObject *alts);
++/* PyAlt, Py_UnwindToken, or NULL */
++
+ /******************************************************
+ 
+   channel related functions
+@@ -223,6 +226,17 @@
+ /* Object, Py_UnwindToken or NULL */
+ 
+ /*
++ * create a new alt object for use in a select.
++ */
++PyAPI_FUNC(PyObject *) PyChannel_Sends(PyChannelObject *self, PyObject *arg,
++				       PyObject *callback);
++/* Object or NULL */
++
++PyAPI_FUNC(PyObject *) PyChannel_Receives(PyChannelObject *self,
++					  PyObject *callback);
++/* Object or NULL */
++
++/*
+  * send an exception over a channel.
+  * the exception will explode at the receiver side.
+  * if nobody is listening, you will get blocked and scheduled.
+@@ -269,6 +283,30 @@
+ 
+ /******************************************************
+ 
++  alt related functions
++
++ ******************************************************/
++
++/*
++ * create a new alt object.
++ * the object is bound to the current tasklet and passed channel at
++ * creation.
++ * type must be derived from PyAlt_Type or NULL.
++ */
++PyAPI_FUNC(PyAltObject *) PyAlt_New(PyTypeObject *type, PyObject *channel,
++				    int dir, PyObject *value,
++				    PyObject *callback);
++
++/*
++ * check if an alt is ready to perform its operation.
++ */
++#define PyAlt_READY(op) \
++	(assert(PyAlt_Check(op)), \
++	 (((PyAltObject *) (op))->channel->balance \
++	  * ((PyAltObject *) (op))->flags.dir < 0))
++
++/******************************************************
++
+   stacklessmodule functions
+ 
+  ******************************************************/
+Index: Makefile.pre.in
+===================================================================
+--- Makefile.pre.in	(revision 80207)
++++ Makefile.pre.in	(working copy)
+@@ -266,6 +266,7 @@
+ 		Stackless/core/slp_transfer.o \
+ 		Stackless/core/stacklesseval.o \
+ 		Stackless/core/stackless_util.o \
++		Stackless/module/altobject.o \
+ 		Stackless/module/channelobject.o \
+ 		Stackless/module/flextype.o \
+ 		Stackless/module/scheduling.o \
